@@ -57,8 +57,8 @@ PyTorch model ──▶ naive baseline (1 attempt, no repair) ──▶ pass? �
         │               │          │                │                │
         ▼               ▼          ▼                ▼                ▼
  legacy/dynamo    strong-typed  optimization   Identity-node    FP32 fallback
- re-export        rebuild       profile        splicing         (from FP16)
- (dynamic_axes)   (FP16→FP32)   injection      (semantics-safe)
+ re-export        FP32 rebuild  profile        splicing         (from FP16)
+ (dynamic_axes)                  injection      (semantics-safe)
         └───────────────┴──────────┼───────────────┴────────────────┘
                                     ▼
                     trtexec build inside subprocess sandbox
@@ -84,7 +84,7 @@ PyTorch model ──▶ naive baseline (1 attempt, no repair) ──▶ pass? �
 | **Deterministic repair tools** | ONNX graph surgery and re-export are provably bounded — no free-form code generation that can silently corrupt a graph. |
 | **Subprocess sandbox** | A `SIGSEGV` or driver timeout during compile can't take down the orchestrator; the crash log is captured as new evidence. |
 | **Real precision verification** | Every "success" is a *measured* cosine against the PyTorch reference — "it compiled" is never treated as "it's correct." |
-| **Bounded retries + escalation** | Max 3 attempts per model; the precision repair tries FP16 first, then escalates to FP32 for guaranteed parity. |
+| **Bounded retries + escalation** | Max 3 attempts per model; repeated failures escalate to a materially different repair instead of rerunning the same action. |
 | **Human approval gate** | Fires once on every build that already passed precision, before any engine is written to the delivery directory. |
 
 ---
@@ -104,13 +104,18 @@ the real error line, and returns one of:
 - `export_shapes_migration` — recovers the torch 2.11 export break. Tries, in
   order: the legacy TorchScript exporter (`dynamo=False`, which still honors
   `dynamic_axes`), then the dynamo path with an explicit `dynamic_shapes` spec,
-  then a static-shape export. First strategy that writes valid ONNX wins.
+  then a static-shape export. If verification fails after a dynamic export, the
+  next attempt deliberately forces static shapes rather than repeating the same
+  graph.
 - `precision_flag_migration` — recovers the TensorRT 10→11 flag removal.
-  Rebuilds the ONNX strongly-typed with **no** precision flag; bakes FP16 into
-  the graph (`onnxconverter-common`, FP32 I/O preserved) on the first attempt,
-  and escalates to a strongly-typed **FP32** rebuild on retry if FP16 drifts.
+  Rebuilds the ONNX strongly-typed in **FP32** with no removed precision flag.
+  A prior FP16-bake experiment was removed after both YOLO and AST produced
+  invalid mixed Float/Half graphs under TensorRT 11.
 - `dynamic_profile_injection` — pins symbolic input dims for shape mismatches
   (via `onnx-graphsurgeon`).
+- `trtexec_profile_args` — derives explicit min/opt/max profiles from each
+  repaired ONNX graph and its benchmark input, preventing trtexec from silently
+  defaulting BERT's dynamic inputs to `1x1` when evaluation uses `1x32`.
 - `node_surgery_splicing` — bypasses provably semantics-preserving `Identity`
   nodes only; refuses anything it can't prove safe.
 
@@ -141,8 +146,8 @@ failure modes on the current `torch 2.11 + TensorRT 11` stack.
 | ResNet-50 | none — builds cleanly (control case) | none (`baseline_already_succeeded`) |
 | ViT-Base | `export_api_incompatibility` (dynamo rejects `dynamic_axes`) | legacy-exporter re-export |
 | BERT-Base | `export_api_incompatibility`, then a padded-sequence precision edge case | re-export; masked-cosine precision (see §6) |
-| YOLOv8n | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed rebuild, FP16→FP32 |
-| Audio Spectrogram Transformer | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed rebuild, FP16→FP32 |
+| YOLOv8n | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed FP32 rebuild |
+| Audio Spectrogram Transformer | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed FP32 rebuild |
 
 BERT is the intentional hard case (see §6) — reported honestly rather than
 quietly retried until it passes.
@@ -184,14 +189,14 @@ dynamo `dynamic_axes` break as ViT; the agent re-exported it successfully, but
 the resulting engine scored a near-orthogonal cosine (~0.05) against the PyTorch
 reference.
 
-Root cause: the input is a ~5-token sentence padded to `max_length=32`, so **~84%
-of the sequence is padding**. A whole-tensor cosine over all 32 positions is
-dominated by padded positions, where the engine and PyTorch legitimately diverge,
-even when the real tokens match. The lesson — *verification metrics must respect
-the model's own masking semantics* — drove the switch to a **masked
-primary-output cosine** that compares only real token positions. This is a
-correctness fix to the metric, not a threshold tweak: padded positions carry no
-meaning and should never have counted.
+The trajectory exposed two concrete issues to test in the next iteration.
+First, trtexec warned that no dynamic profile was supplied and silently built
+all three BERT inputs as `1x1`, while the evaluation input is `1x32`. The latest
+code now derives and supplies explicit min/opt/max profiles. Second, the input
+is a short sentence padded to `max_length=32`; a whole-tensor cosine can be
+dominated by semantically meaningless padded positions. The latest verifier
+therefore reports a **masked primary-output cosine** over real tokens only.
+Neither change is counted as a success until the confirming T4 run passes.
 
 > Reproducibility note: the masked-cosine metric is the latest iteration and is
 > pending its confirming T4 re-run; the table in §5 reflects the last fully
@@ -207,9 +212,9 @@ meaning and should never have counted.
 | Baseline | Naive `torch.onnx.export` + `trtexec`, single attempt, TensorRT-10 flags, no repair | 1/5 verified builds | Established starting point |
 | Iteration 1 | Evidence-based classifier routing on the real error line instead of the trtexec `--help` tail | Correctly labeled all 4 failures (was mislabeling `--fp16` as precision drift) | Kept |
 | Iteration 2 | `export_shapes_migration` with legacy-exporter fallback for the torch 2.11 `dynamic_axes` break | ViT recovered, cosine 1.0 | Kept |
-| Iteration 3 | `precision_flag_migration` for the TensorRT 11 `--fp16` removal (strong-typed rebuild, FP16 bake → FP32 escalation) | YOLO + AST recovered, cosine ~1.0 | Kept |
-| Iteration 4 | Dtype-correct engine input binding + `KwargWrapper` to stop attention_mask/token_type_ids being swapped on export | Fixed a bogus BERT ~0.05 that came from int64→int32 and arg-order bugs | Kept |
-| Iteration 5 | Masked primary-output cosine (compare only real token positions) | Isolated the remaining BERT gap to padded positions (see §6) | Pending re-validation |
+| Iteration 3 | Tested an FP16 graph bake for TensorRT 11 | YOLO and AST failed with mixed Float/Half graph errors | Removed; go directly to the verified FP32 recovery |
+| Iteration 4 | Dtype-correct engine input binding + `KwargWrapper` to keep BERT inputs aligned | Removed two potential sources of invalid comparison; BERT still scored ~0.05 | Kept, but not claimed as the full fix |
+| Iteration 5 | Added masked primary-output cosine and explicit TensorRT min/opt/max profiles after BERT was silently built for `1x1` | Evidence: BERT trajectory warning plus padded `1x32` input | Pending re-validation |
 | Final | Combined the changes that verified | **4/5 verified builds** (baseline 1/5) | Main contribution: evidence-routed deterministic repair for current toolchain breaks |
 
 ---
@@ -237,7 +242,8 @@ the first `trtexec` build). **Cost:** free-tier Colab T4.
    failures as model failures.
 5. **Recovery + verification:** Cell 20 runs the agent; Cell 22 fires the human
    approval gate for each verified build; Cell 23 prints the final comparison
-   table (also saved to `logs/final_summary.json`).
+   table and renders a three-panel evidence chart (saved to
+   `logs/final_summary.json` and `logs/rift_results.png`).
 
 **Expected output:** a baseline of 1/5 verified builds and a Rift result of 4/5
 (ResNet control + ViT/YOLO/AST recovered), with BERT reported per §6. Artifacts
@@ -257,7 +263,8 @@ rift-trt-migrator/
 Generated at runtime (on Colab / Drive):
 
 ```
-logs/            environment.json, versions.json, baseline/, approval/, final_summary.json
+logs/            environment.json, versions.json, baseline/, approval/, final_summary.json,
+                 rift_results.png
 trajectories/    <model>_classification.json, <model>.json  (per-agent trajectories)
 onnx/            baseline_*.onnx, repair_*.onnx
 engines/         built + approved .engine files
