@@ -44,36 +44,36 @@ and a hard guarantee that precision was verified before anything ships.
 
 ## 2. What Rift does (overview)
 
-```
-PyTorch model ──▶ naive baseline (1 attempt, no repair) ──▶ pass? ──▶ done
-                                    │ fail
-                                    ▼
-                         Diagnostic Classifier  (reads real stderr/traceback)
-                                    │
-        ┌───────────────┬──────────┼───────────────┬────────────────┐
-        ▼               ▼          ▼                ▼                ▼
- export_api_      precision_    shape_        unsupported_      precision_
- incompatibility  flag_removed  mismatch      operator          drift
-        │               │          │                │                │
-        ▼               ▼          ▼                ▼                ▼
- legacy/dynamo    strong-typed  optimization   Identity-node    FP32 fallback
- re-export        FP32 rebuild  profile        splicing         (from FP16)
- (dynamic_axes)                  injection      (semantics-safe)
-        └───────────────┴──────────┼───────────────┴────────────────┘
-                                    ▼
-                    trtexec build inside subprocess sandbox
-                    (SIGSEGV / driver aborts isolated from the orchestrator)
-                                    │
-                                    ▼
-              precision verification — masked primary-output cosine
-                              (threshold > 0.99)
-                          │                     │
-                    pass  │                     │  fail
-                          ▼                     ▼
-                 Human Approval Gate     bounded retry (≤ 3) → escalate
-                          │                     │  else graceful exit
-                          ▼
-              Validated production TensorRT engine
+```mermaid
+flowchart TD
+    A["PyTorch model"] --> B{"Naive baseline<br/>(1 attempt, no repair)"}
+    B -->|pass| Z["Done"]
+    B -->|fail| C["Diagnostic Classifier<br/><i>reads real stderr / traceback</i>"]
+
+    C --> D1["export_api_<br/>incompatibility"]
+    C --> D2["precision_<br/>flag_removed"]
+    C --> D3["shape_<br/>mismatch"]
+    C --> D4["unsupported_<br/>operator"]
+    C --> D5["precision_<br/>drift"]
+
+    D1 --> R1["Legacy / dynamo re-export<br/><i>dynamic_axes migration</i>"]
+    D2 --> R2["Strong-typed FP32 rebuild<br/><i>drop removed --fp16</i>"]
+    D3 --> R3["Optimization profile injection<br/><i>onnx-graphsurgeon</i>"]
+    D4 --> R4["Identity-node splicing<br/><i>semantics-safe only</i>"]
+    D5 --> R5["FP32 fallback<br/><i>from FP16 graph</i>"]
+
+    R1 --> E["trtexec build<br/><i>subprocess sandbox</i>"]
+    R2 --> E
+    R3 --> E
+    R4 --> E
+    R5 --> E
+
+    E --> F{"Masked primary-output<br/>cosine &gt; 0.99?"}
+    F -->|pass| G["Human Approval Gate"]
+    F -->|fail| H{"Retries left?<br/>(≤ 3)"}
+    H -->|yes| C
+    H -->|no| I["Graceful exit<br/><i>exhausted_retries</i>"]
+    G --> J["Validated TensorRT engine"]
 ```
 
 **Design choices that matter (and why):**
@@ -145,7 +145,7 @@ failure modes on the current `torch 2.11 + TensorRT 11` stack.
 |---|---|---|
 | ResNet-50 | none — builds cleanly (control case) | none (`baseline_already_succeeded`) |
 | ViT-Base | `export_api_incompatibility` (dynamo rejects `dynamic_axes`) | legacy-exporter re-export |
-| BERT-Base | `export_api_incompatibility`, then a padded-sequence precision edge case | re-export; masked-cosine precision (see §6) |
+| BERT-Base | `export_api_incompatibility` (fixed); remaining precision verification gap at seq_len=32 (see §6) | re-export + masked-cosine verification |
 | YOLOv8n | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed FP32 rebuild |
 | Audio Spectrogram Transformer | `precision_flag_removed` (`Unknown option: --fp16`) | strong-typed FP32 rebuild |
 
@@ -163,17 +163,20 @@ hand-entered.
 
 | Model | Baseline | Rift | Cosine | Retries |
 |---|---|---|---|---|
-| ResNet-50 | SUCCESS | baseline_already_succeeded | 1.00000 | 0 |
-| ViT-Base | MODEL_EXPORT_FAILURE | **repaired_and_verified** | 1.00000 | 1 |
-| BERT-Base | MODEL_EXPORT_FAILURE | documented hard case (see §6) | — | 3 |
-| YOLOv8n | TENSORRT_BUILD_FAILURE | **repaired_and_verified** | ~1.00000 | 2 |
-| Audio Spectrogram Transformer | TENSORRT_BUILD_FAILURE | **repaired_and_verified** | ~1.00000 | 2 |
+| ResNet-50 | SUCCESS | baseline_already_succeeded | ~1.00000 | 0 |
+| ViT-Base | MODEL_EXPORT_FAILURE | **repaired_and_verified** | ~1.00000 | 1 |
+| BERT-Base | MODEL_EXPORT_FAILURE | export/build recovered; **verification failed** (see §6) | **0.8998** | 3 |
+| YOLOv8n | TENSORRT_BUILD_FAILURE | **repaired_and_verified** | ~1.00000 | 1 |
+| Audio Spectrogram Transformer | TENSORRT_BUILD_FAILURE | **repaired_and_verified** | ~1.00000 | 1 |
 
 | Metric | Simple baseline | Rift agent | Change |
 |---|---|---|---|
 | Verified TensorRT builds | **1 / 5** | **4 / 5** | **+3** |
 | Human approvals required | n/a | 3 (one per recovered build) | — |
-| Retries per recovered build (avg) | n/a | ~1.7 | — |
+| Retries per recovered build (avg) | n/a | ~1.0 (ViT / YOLO / AST) | — |
+
+Validated **2026-08-31** on Colab T4. Source: `logs/final_summary.json` and
+`trajectories/*.json` from the latest GPU run.
 
 The baseline is a genuinely naive single-attempt pipeline (naive `torch.onnx.export`
 + `trtexec`, TensorRT-10 habits, no repair). The 3-build improvement comes
@@ -184,24 +187,30 @@ paths get the same models, inputs, and evaluation.
 
 ## 6. Main failure mode & what it revealed
 
-**BERT-Base** is the honest hard case. Its baseline export first hit the same
-dynamo `dynamic_axes` break as ViT; the agent re-exported it successfully, but
-the resulting engine scored a near-orthogonal cosine (~0.05) against the PyTorch
-reference.
+**BERT-Base** remains the honest hard case, but the re-validated T4 run (2026-08-31)
+shows clear progress.
 
-The trajectory exposed two concrete issues to test in the next iteration.
-First, trtexec warned that no dynamic profile was supplied and silently built
-all three BERT inputs as `1x1`, while the evaluation input is `1x32`. The latest
-code now derives and supplies explicit min/opt/max profiles. Second, the input
-is a short sentence padded to `max_length=32`; a whole-tensor cosine can be
-dominated by semantically meaningless padded positions. The latest verifier
-therefore reports a **masked primary-output cosine** over real tokens only.
-Neither change is counted as a success until the confirming T4 run passes.
+**What Rift fixed:** Baseline export failed on the PyTorch 2.11 `dynamic_axes`
+break. Rift re-exported BERT successfully on all three attempts and built
+TensorRT engines each time (`returncode: 0`).
 
-> Reproducibility note: the masked-cosine metric is the latest iteration and is
-> pending its confirming T4 re-run; the table in §5 reflects the last fully
-> validated run in which BERT was still counted as a failure. This section will
-> be updated to the re-validated BERT number once that run completes.
+**What still fails:** Masked primary-output cosine plateaued at **~0.90**
+(best attempt: **0.8998**), below the **0.99** deployment threshold. Status:
+`exhausted_retries` — Rift correctly refused deployment.
+
+**What Iteration 5 changed:** Explicit min/opt/max profiles for `input_ids`,
+`token_type_ids`, and `attention_mask`, plus masked cosine over real tokens (not
+padded positions). Cosine improved from **~0.05 → ~0.90**, but did not cross
+the gate.
+
+**Remaining hypothesis:** TRT still warns about Int64 bindings and, during
+profiling, may default dynamic inputs to `1x1` when shapes are not passed to
+`trtexec --loadEngine`. The gap from 0.90 → 0.99 likely needs a follow-up
+repair (e.g. enforce int32 bindings end-to-end, pass `--shapes=...` at inference,
+or compare logits only over the `[CLS]` position).
+
+**Lesson:** Build success is not deployment success. Without numerical
+verification, BERT would have shipped as a "successful" migration.
 
 ---
 
@@ -214,7 +223,7 @@ Neither change is counted as a success until the confirming T4 run passes.
 | Iteration 2 | `export_shapes_migration` with legacy-exporter fallback for the torch 2.11 `dynamic_axes` break | ViT recovered, cosine 1.0 | Kept |
 | Iteration 3 | Tested an FP16 graph bake for TensorRT 11 | YOLO and AST failed with mixed Float/Half graph errors | Removed; go directly to the verified FP32 recovery |
 | Iteration 4 | Dtype-correct engine input binding + `KwargWrapper` to keep BERT inputs aligned | Removed two potential sources of invalid comparison; BERT still scored ~0.05 | Kept, but not claimed as the full fix |
-| Iteration 5 | Added masked primary-output cosine and explicit TensorRT min/opt/max profiles after BERT was silently built for `1x1` | Evidence: BERT trajectory warning plus padded `1x32` input | Pending re-validation |
+| Iteration 5 | Added masked primary-output cosine and explicit TensorRT min/opt/max profiles after BERT was silently built for `1x1` | Re-validated on T4: BERT cosine **0.05 → 0.90**; export/build fully recovered; verification still below 0.99 | Kept — partial fix; BERT remains documented hard case |
 | Final | Combined the changes that verified | **4/5 verified builds** (baseline 1/5) | Main contribution: evidence-routed deterministic repair for current toolchain breaks |
 
 ---
@@ -248,7 +257,8 @@ the first `trtexec` build). **Cost:** free-tier Colab T4.
 **Expected output:** a baseline of 1/5 verified builds and a Rift result of 4/5
 (ResNet control + ViT/YOLO/AST recovered), with BERT reported per §6. Artifacts
 are written to `logs/`, `trajectories/`, `onnx/`, and approved engines to
-`engines/`.
+`engines/`. ONNX and engine binaries are regenerated at runtime and are
+intentionally excluded from the repo (too large for submission zips).
 
 ---
 
@@ -296,6 +306,8 @@ surfaces at runtime. High agent reliability here came from pairing an LLM-style
 **diagnostic layer** (route the failure from real evidence) with **deterministic,
 graph-level surgical tools** inside a closed-loop sandbox that bounds the action
 space *and* verifies numerical parity before a human ever sees the result. The
-biggest single lesson came from the one case that failed: a verification metric
-that ignores the model's own masking semantics will reject a correct engine —
-so the precision check has to be as domain-aware as the repair itself.
+biggest single lesson came from BERT: cosine jumped from ~0.05 to ~0.90 after
+domain-aware verification and dynamic profiles, but the gate still blocked
+deployment — proving that **build success and numerical parity are different
+bars**, and an agent that only optimizes for `trtexec` exit codes would ship
+broken engines.
